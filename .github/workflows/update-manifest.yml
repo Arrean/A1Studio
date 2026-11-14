@@ -1,0 +1,98 @@
+name: 生成更新清单
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release 草稿标签，例如 v1.0.6"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-manifest-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: 下载安装包并生成清单
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:GH_REPO -ne 'Arrean/A1Studio') {
+            throw 'This workflow is intended for Arrean/A1Studio.'
+          }
+
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw '标签必须采用 v1.0.6 这样的稳定版格式。'
+          }
+          $version = $Matches[1]
+          $name = "A1Studio-$version-Setup.exe"
+
+          $raw = gh release view $tag --json isDraft,isPrerelease,assets
+          if ($LASTEXITCODE -ne 0) {
+            throw '找不到该 Release，请先保存草稿并上传安装包。'
+          }
+          $release = $raw | ConvertFrom-Json
+
+          if (!$release.isDraft -or $release.isPrerelease) {
+            throw '仅处理稳定版草稿，不修改已发布版本或预发布版。'
+          }
+
+          if (@($release.assets | Where-Object name -eq 'latest.json').Count -gt 0) {
+            throw '草稿已存在 latest.json，停止以避免覆盖。'
+          }
+
+          $assets = @($release.assets | Where-Object name -eq $name)
+          if ($assets.Count -ne 1) {
+            throw "草稿中必须有一个名为 $name 的安装包。"
+          }
+
+          $folder = Join-Path $env:RUNNER_TEMP 'a1studio-update'
+          New-Item -ItemType Directory -Path $folder -ErrorAction Stop | Out-Null
+
+          gh release download $tag --pattern $name --dir $folder
+          if ($LASTEXITCODE -ne 0) {
+            throw '下载安装包失败。'
+          }
+
+          $installer = Get-Item -LiteralPath (Join-Path $folder $name)
+          $peVersion = $installer.VersionInfo.ProductVersion.Split('+')[0].Trim()
+          if ($peVersion -ne $version) {
+            throw "安装包内部版本 $peVersion 与标签 $tag 不一致。"
+          }
+
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            version = $version
+            tag = $tag
+            channel = 'stable'
+            platform = 'windows-x64'
+            url = "https://github.com/Arrean/A1Studio/releases/download/$tag/$name"
+            size = $installer.Length
+            sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash
+            notes = ''
+          }
+
+          $output = Join-Path $folder 'latest.json'
+          $manifest | ConvertTo-Json |
+            Set-Content -LiteralPath $output -Encoding utf8NoBOM
+
+          gh release upload $tag $output
+          if ($LASTEXITCODE -ne 0) {
+            throw '上传清单失败，Release 保持草稿。'
+          }
+
+          Write-Host "完成：$name 对应的 latest.json 已加入草稿。"
